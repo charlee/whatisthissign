@@ -1,12 +1,20 @@
 import argparse
 import random
+import time
 import csv
 import os
+import signal
+from multiprocessing import Pool
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
 import tensorflow as tf
+
 
 IMAGE_SIZE = 32
 
 sess = tf.Session()
+tf.logging.set_verbosity(tf.logging.ERROR)
 
 def _bytes_feature(value):
     return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
@@ -14,52 +22,66 @@ def _bytes_feature(value):
 def _int64_feature(value):
     return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
 
-def read_images(filename_set, directory):
-    """Read the files in directory specified by filename_set and save them as TFRecord."""
-    for filename, label_id in filename_set:
-        filepath = os.path.join(directory, filename)
-        image = tf.read_file(filepath)
-        image = tf.image.decode_png(image)
-        image = tf.image.rgb_to_grayscale(image)
-        image = tf.image.resize_images(image, [IMAGE_SIZE, IMAGE_SIZE])
 
-        image_data = sess.run(tf.cast(image, tf.uint8)).tobytes()
-        example = tf.train.Example(features=tf.train.Features(feature={
-            'image': _bytes_feature(image_data),
-            'label': _int64_feature(int(label_id)),
-        }))
+class BatchProcessor(object):
+    def __init__(self, batch_set, directory, output_path):
+        self.output_path = output_path
+        self.batch_set = batch_set
+        self.directory = directory
 
-        yield example
-
-
-class TFWriter(object):
-    def __init__(self, output_dir, prefix, batch_size):
-        self.output_dir = output_dir
-        self.tf_count = 0
-        self.tf_writer = None
-        self.prefix = prefix
-        self.batch_size = batch_size
+        output_dir = os.path.dirname(self.output_path)
 
         if not os.path.isdir(output_dir):
             os.makedirs(output_dir)
 
-    def write(self, example):
-        """Write example to TFRecord."""
-        if self.tf_count % 100 == 0:
-            self.close()
+    def run(self):
+        """Read the files in directory specified by filename_set and save them as TFRecord."""
+        self.tf_writer = tf.python_io.TFRecordWriter(self.output_path)
 
-            record_filename = '{0}-{1:08d}.tfrecords'.format(self.prefix, self.tf_count)
-            record_path = os.path.join(self.output_dir, record_filename)
-            self.tf_writer = tf.python_io.TFRecordWriter(record_path)
+        for filename, label_id in self.batch_set:
+            filepath = os.path.join(self.directory, filename)
+            image = tf.read_file(filepath)
+            image = tf.image.decode_png(image)
+            image = tf.image.rgb_to_grayscale(image)
+            image = tf.image.resize_images(image, [IMAGE_SIZE, IMAGE_SIZE])
 
-            print('Generating TFRecord in {}...'.format(record_path))
+            image_data = sess.run(tf.cast(image, tf.uint8)).tobytes()
+            example = tf.train.Example(features=tf.train.Features(feature={
+                'image': _bytes_feature(image_data),
+                'label': _int64_feature(int(label_id)),
+            }))
 
-        self.tf_writer.write(example.SerializeToString())
-        self.tf_count += 1
+            self.tf_writer.write(example.SerializeToString())
 
-    def close(self):
-        if self.tf_writer:
-            self.tf_writer.close()
+        self.tf_writer.close()
+
+
+def run_batch_process(task):
+    """A process that handles a single batch. This process accept one set of training example entries from CSV
+    and write them to a single TFRecord file."""
+    print('PID:{}: Generating TFRecord in {}... start with {}'.format(os.getpid(), task['tf_path'], task['batch_set'][0]))
+
+    batch = BatchProcessor(task['batch_set'], task['directory'], task['tf_path'])
+    batch.run()
+
+
+def start_pool(tasks):
+    # Ignore SIGINT before creating pool so that created children processes inherit SIGINT handler.
+    print('Pool controller PID = {}'.format(os.getpid()))
+    original_signal_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pool = Pool(processes=2)
+    signal.signal(signal.SIGINT, original_signal_handler)
+
+    try:
+        res = pool.map_async(run_batch_process, tasks)
+        res.get(99999)
+    except KeyboardInterrupt:
+        print('Caught KeyboardInterrupt, kill workers')
+        pool.terminate()
+    else:
+        pool.close()
+
+    pool.join()
 
 
 def main(image_dir, output_dir, batch_size=100, train_ratio=80):
@@ -71,29 +93,36 @@ def main(image_dir, output_dir, batch_size=100, train_ratio=80):
 
                 dir_name = os.path.basename(root)
 
-                training_writer = TFWriter(os.path.join(output_dir, dir_name), 'training', 100)
-                test_writer = TFWriter(os.path.join(output_dir, dir_name), 'test', 100)
-
                 file_path = os.path.join(root, file)
                 with open(file_path, 'r') as f:
                     rows = list(csv.reader(f))
 
                 random.shuffle(rows)
 
-                training_set_size = len(rows) * 80 // 100
+                training_set_size = len(rows) * train_ratio // 100
                 training_set = rows[:training_set_size]
                 test_set = rows[training_set_size:]
+
+
+                tasks = []
+                for i in range(0, len(training_set), batch_size):
+                    tasks.append({
+                        'batch_set': training_set[i:i+batch_size],
+                        'directory': root,
+                        'tf_path': os.path.join(output_dir, dir_name, 'training-{0:08d}.tfrecords'.format(i)),
+                    })
+
+                for i in range(0, len(test_set), batch_size):
+                    tasks.append({
+                        'batch_set': test_set[i:i+batch_size],
+                        'directory': root,
+                        'tf_path': os.path.join(output_dir, dir_name, 'test-{0:08d}.tfrecords'.format(i)),
+                    })
 
                 print('Processing {}, total={}, training={}, test={}'.format(
                     file_path, len(rows), len(training_set), len(test_set)))
 
-                for example in read_images(training_set, root):
-                    training_writer.write(example)
-                for example in read_images(test_set, root):
-                    test_writer.write(example)
-
-                training_writer.close()
-                test_writer.close()
+                start_pool(tasks)
 
 
 if __name__ == '__main__':
