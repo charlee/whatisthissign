@@ -4,7 +4,8 @@ import time
 import csv
 import os
 import signal
-from multiprocessing import Pool
+
+import threading
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
@@ -13,7 +14,6 @@ import tensorflow as tf
 
 IMAGE_SIZE = 32
 
-sess = tf.Session()
 tf.logging.set_verbosity(tf.logging.ERROR)
 
 def _bytes_feature(value):
@@ -23,8 +23,10 @@ def _int64_feature(value):
     return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
 
 
-class BatchProcessor(object):
-    def __init__(self, batch_set, directory, output_path):
+class BatchThread(threading.Thread):
+    def __init__(self, batch_set, directory, output_path, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
         self.output_path = output_path
         self.batch_set = batch_set
         self.directory = directory
@@ -36,6 +38,10 @@ class BatchProcessor(object):
 
     def run(self):
         """Read the files in directory specified by filename_set and save them as TFRecord."""
+        print('PID:{}: Generating TFRecord in {}... start with {}'.format(
+            threading.get_ident(), self.output_path, self.batch_set[0]))
+
+        sess = tf.Session()
         self.tf_writer = tf.python_io.TFRecordWriter(self.output_path)
 
         for filename, label_id in self.batch_set:
@@ -56,32 +62,18 @@ class BatchProcessor(object):
         self.tf_writer.close()
 
 
-def run_batch_process(task):
-    """A process that handles a single batch. This process accept one set of training example entries from CSV
-    and write them to a single TFRecord file."""
-    print('PID:{}: Generating TFRecord in {}... start with {}'.format(os.getpid(), task['tf_path'], task['batch_set'][0]))
 
-    batch = BatchProcessor(task['batch_set'], task['directory'], task['tf_path'])
-    batch.run()
-
-
-def start_pool(tasks):
+def start_process_manager(tasks):
     # Ignore SIGINT before creating pool so that created children processes inherit SIGINT handler.
-    print('Pool controller PID = {}'.format(os.getpid()))
-    original_signal_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    pool = Pool(processes=2)
-    signal.signal(signal.SIGINT, original_signal_handler)
+    print('Process manager controller PID = {}'.format(os.getpid()))
 
-    try:
-        res = pool.map_async(run_batch_process, tasks)
-        res.get(99999)
-    except KeyboardInterrupt:
-        print('Caught KeyboardInterrupt, kill workers')
-        pool.terminate()
-    else:
-        pool.close()
+    workers = [BatchThread(task['batch_set'], task['directory'], task['tf_path']) for task in tasks]
 
-    pool.join()
+    for w in workers:
+        w.start()
+
+    for w in workers:
+        w.join()
 
 
 def main(image_dir, output_dir, batch_size=100, train_ratio=80):
@@ -122,7 +114,7 @@ def main(image_dir, output_dir, batch_size=100, train_ratio=80):
                 print('Processing {}, total={}, training={}, test={}'.format(
                     file_path, len(rows), len(training_set), len(test_set)))
 
-                start_pool(tasks)
+                start_process_manager(tasks)
 
 
 if __name__ == '__main__':
