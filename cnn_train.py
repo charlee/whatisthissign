@@ -1,13 +1,18 @@
 import os
 import tensorflow as tf
+import argparse
 
 
 IMAGE_SIZE = 32
 CLASSES = 43
 
+FLAGS = {}
+
+tf.logging.set_verbosity(tf.logging.INFO)
+
 def cnn_model_fn(features, labels, mode):
     # Input Layer
-    input_layer = tf.reshape(features['image'], [-1, IMAGE_SIZE, IMAGE_SIZE, 1])
+    input_layer = tf.reshape(features, [-1, IMAGE_SIZE, IMAGE_SIZE, 1])
 
     # Convolutional Layer #1 => 32 maps, 32x32
     conv1 = tf.layers.conv2d(
@@ -68,11 +73,117 @@ def cnn_model_fn(features, labels, mode):
     return tf.estimator.EstimatorSpec(mode=mode, loss=loss, eval_metric_ops=eval_metric_ops)
 
 
-def train_input_fn(max_examples_count=-1):
-    """Feed max_examples_count examples for each class to estimator."""
+def read_and_decode(filename_queue):
+    """Read from tfrecords file and decode and normalize the image data."""
+    reader = tf.TFRecordReader()
+    _, serialized_exmaple = reader.read(filename_queue)
+    features = tf.parse_single_example(
+        serialized_exmaple,
+        features={
+            'image': tf.FixedLenFeature([], tf.string),
+            'label': tf.FixedLenFeature([], tf.int64),
+        },
+    )
+
+    image = tf.decode_raw(features['image'], tf.uint8)
+    image.set_shape([IMAGE_SIZE * IMAGE_SIZE])
+
+    # Convert from [0, 255] -> [-0.5, 0.5] floats.
+    image = tf.cast(image, tf.float32) * (1. / 255) - 0.5
+
+    label = tf.cast(features['label'], tf.int32)
+
+    return image, label
 
 
-def main():
+def train_input_fn(train_dir, batch_size=100, max_tfrecords_count=-1):
+    """Feed max_tfrecords_count TFRecords for each class to estimator."""
+    filename_list = []
+    for root, dirs, files in os.walk(train_dir):
+        tfrecords = [os.path.join(root, f) for f in files if f.endswith('.tfrecords') and f.startswith('training-')]
+        if len(tfrecords) > 0:
+            if max_tfrecords_count == -1:
+                filename_list += tfrecords
+            else:
+                filename_list += tfrecords[0:max_tfrecords_count]
+
+    filename_list = filename_list[0:1]
+
+    with tf.name_scope('input'):
+        filename_queue = tf.train.string_input_producer(filename_list)
+
+        image, label = read_and_decode(filename_queue)
+
+        images, labels = tf.train.shuffle_batch(
+            [image, label],
+            batch_size=batch_size,
+            num_threads=2,
+            capacity=1000 + 3 * batch_size,
+            min_after_dequeue=1000,
+        )
+
+        return images, labels
+
+
+class IteratorInitializerHook(tf.train.SessionRunHook):
+    """Hook to initialise data iterator after Session is created."""
+
+    def __init__(self):
+        super(IteratorInitializerHook, self).__init__()
+        self.iterator_initializer_func = None
+
+    def after_create_session(self, session, coord):
+        """Initialise the iterator after the session has been created."""
+        self.iterator_initializer_func(session)
+
+
+def make_dataset_inputs_fn(train_dir, prefix='training', batch_size=100):
+    filename_list = []
+    for root, dirs, files in os.walk(train_dir):
+        tfrecords = [os.path.join(root, f) for f in files
+                     if f.endswith('.tfrecords') and f.startswith('{}-'.format(prefix))]
+        if len(tfrecords) > 0:
+            filename_list += tfrecords
+
+    def _parse_example(example):
+        features = tf.parse_single_example(example, features={
+            'image': tf.FixedLenFeature([], tf.string),
+            'label': tf.FixedLenFeature([], tf.int64),
+        })
+
+        image = tf.decode_raw(features['image'], tf.uint8)
+        image.set_shape([IMAGE_SIZE * IMAGE_SIZE])
+
+        # Convert from [0, 255] -> [-0.5, 0.5] floats.
+        image = tf.cast(image, tf.float32) * (1. / 255) - 0.5
+
+        label = tf.cast(features['label'], tf.int32)
+
+        return image, label
+
+    iterator_initializer_hook = IteratorInitializerHook()
+
+    def input_fn():
+
+        with tf.name_scope('input_data'):
+            dataset = tf.contrib.data.TFRecordDataset(filename_list)
+            dataset = dataset.map(_parse_example)
+            dataset = dataset.repeat()
+            dataset = dataset.shuffle(buffer_size=10000)
+            dataset = dataset.batch(batch_size)
+
+            iterator = dataset.make_initializable_iterator()
+            iterator_initializer_hook.iterator_initializer_func = lambda sess: sess.run(
+                iterator.initializer
+            )
+
+            next_example, next_label = iterator.get_next()
+            return next_example, next_label
+
+    return input_fn, iterator_initializer_hook
+
+
+def main(_):
     model_dir = os.path.join('tmp', 'gtsrb_cnn_model')
     if not os.path.isdir(model_dir):
         os.makedirs(model_dir)
@@ -81,10 +192,60 @@ def main():
 
     # Setup logging hook
     tensors_to_long = {'probabilities': 'softmax_tensor'}
+
     logging_hook = tf.train.LoggingTensorHook(tensors=tensors_to_long, every_n_iter=50)
 
+    input_fn, iterializer_initializer_hook = make_dataset_inputs_fn(
+        FLAGS.train_dir, batch_size=100)
 
-    pass
+    gtsrb_classifier.train(
+        input_fn=input_fn,
+        steps=100000,
+        hooks=[iterializer_initializer_hook, logging_hook],
+    )
+
+    eval_input_fn, iterializer_initializer_hook = make_dataset_inputs_fn(
+        FLAGS.train_dir, batch_size=100, prefix='test'
+    )
+    eval_results = gtsrb_classifier.evaluate(
+        input_fn=eval_input_fn,
+        steps=2000,
+        hooks=[iterializer_initializer_hook],
+    )
+
+    print(eval_results)
+
+    # If want to construct model manually.....
+    # features = tf.placeholder(tf.float32, shape=[None, IMAGE_SIZE * IMAGE_SIZE])
+    # labels = tf.placeholder(tf.int32, shape=[None, CLASSES])
+    #
+    # model = cnn_model_fn(features, labels, tf.estimator.ModeKeys.TRAIN)
+
+
+    # with tf.Session() as sess:
+    #
+    #     sess.run(tf.global_variables_initializer())
+    #     print(sess.run(next_image))
+        # # Start input enqueue threads.
+        # coord = tf.train.Coordinator()
+        # threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+        #
+        #
+        # coord.request_stop()
+        # coord.join(threads)
+
+
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--train-dir',
+        type=str,
+        default='data/examples-32',
+        help='Train data directory.',
+    )
+
+    FLAGS, unparsed = parser.parse_known_args()
+    FLAGS.train_dir = FLAGS.train_dir.replace('/', os.sep)
+
+    tf.app.run()
